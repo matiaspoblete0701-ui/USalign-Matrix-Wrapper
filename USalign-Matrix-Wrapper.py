@@ -5,7 +5,7 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 from tqdm import tqdm
 import scipy
-from scipy.cluster.hierarchy import linkage, dendrogram, fcluster
+from scipy.cluster.hierarchy import linkage, dendrogram, fcluster, to_tree
 from sklearn.metrics import silhouette_score
 import os
 import time
@@ -34,7 +34,6 @@ def definir_argumentos():
     parser.add_argument("-d", "--outdir", type=str, default="resultados", help="Carpeta de salida")
     return parser.parse_args()
 
-# --- NUEVA FUNCIÓN PARA EL UMBRAL DINÁMICO ---
 def optimizar_clustering(agrup, m_dist, n):
     """Prueba diferentes números de clusters y devuelve el mejor umbral basado en Silhouette."""
     mejor_score = -1
@@ -54,6 +53,28 @@ def optimizar_clustering(agrup, m_dist, n):
     # El umbral se sitúa justo por debajo del salto que genera el mejor_k
     umbral_dinamico = alturas[-mejor_k + 1] if mejor_k > 1 else alturas.max()
     return umbral_dinamico, mejor_k, mejor_score
+
+# --- NUEVAS FUNCIONES PARA NEWICK ---
+def construir_newick(nodo, newick, parentdist, nombres_hojas):
+    """Función recursiva para traducir nodos de SciPy a texto Newick."""
+    if nodo.is_leaf():
+        return f"{nombres_hojas[nodo.id]}:{(parentdist - nodo.dist):.6f}{newick}"
+    else:
+        if len(newick) > 0:
+            newick = f":{(parentdist - nodo.dist):.6f}{newick}"
+        newick = f"({construir_newick(nodo.left, '', nodo.dist, nombres_hojas)},{construir_newick(nodo.right, '', nodo.dist, nombres_hojas)}){newick}"
+        return newick
+
+def guardar_newick(agrup, etiquetas, args):
+    """Genera y guarda el archivo .nwk"""
+    if args.output:
+        arbol = to_tree(agrup, rd=False)
+        cadena_newick = construir_newick(arbol, "", arbol.dist, etiquetas) + ";"
+        ruta_newick = os.path.join(args.outdir, f"{args.output}_arbol.nwk")
+        with open(ruta_newick, "w") as f:
+            f.write(cadena_newick)
+        print(f"Formato Newick guardado en: {ruta_newick}")
+# ------------------------------------
 
 def guardar_matrices_csv(m_sim, m_dist, etiquetas, args):
     if args.output:
@@ -162,7 +183,7 @@ def main():
                 tiempo_total += tiempo  
                 pbar.update(1)
     
-    print(f"El tiempo de ejecución fue de {tiempo_total:.2f} segundos.")
+    print(f"El tiempo de ejecución fue de {tiempo_total:.2f} segundos ->> {int(tiempo_total//3600)} horas con {int((tiempo_total%3600)//60)} minutos con {tiempo_total%60:.2f} segundos")
     print(f"Promedio: {tiempo_total/total_comparaciones:.2f} s por cálculo.")
 
     m_sim_s = (m_sim + m_sim.T) / 2 
@@ -182,7 +203,7 @@ def main():
     umbral, k_optimo, score_optimo = optimizar_clustering(agrup, m_dist, n)
     print(f"Configuración óptima: {k_optimo} clusters (Silhouette: {score_optimo:.3f})")
 
-    # --- GENERACIÓN DE GRÁFICOS ---
+    # --- GENERACIÓN DE GRÁFICOS Y NEWICK ---
     print("Generando Heatmaps...")
     generar_heat_maps(m_sim_s, m_dist, etiquetas, args)
 
@@ -197,6 +218,9 @@ def main():
         nombre_dendro = os.path.join(args.outdir, f"{args.output}_dendrograma.png")
         plt.savefig(nombre_dendro, dpi=300, bbox_inches='tight')
         print(f"Dendrograma guardado en: {nombre_dendro}")
+        
+        # Guardamos el formato Newick justo después del dendrograma
+        guardar_newick(agrup, etiquetas, args)
         
     plt.show()
 
