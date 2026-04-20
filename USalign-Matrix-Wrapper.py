@@ -5,7 +5,8 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 from tqdm import tqdm
 import scipy
-from scipy.cluster.hierarchy import linkage, dendrogram
+from scipy.cluster.hierarchy import linkage, dendrogram, fcluster
+from sklearn.metrics import silhouette_score
 import os
 import time
 import argparse
@@ -32,6 +33,27 @@ def definir_argumentos():
     parser.add_argument("-o", "--output", type=str, help="Prefijo para los archivos")
     parser.add_argument("-d", "--outdir", type=str, default="resultados", help="Carpeta de salida")
     return parser.parse_args()
+
+# --- NUEVA FUNCIÓN PARA EL UMBRAL DINÁMICO ---
+def optimizar_clustering(agrup, m_dist, n):
+    """Prueba diferentes números de clusters y devuelve el mejor umbral basado en Silhouette."""
+    mejor_score = -1
+    mejor_k = 2
+    
+    # Probamos desde 2 clusters hasta n-1 (máximo 10 para evitar ruido)
+    rango_k = range(2, min(n, 11)) 
+    
+    for k in rango_k:
+        labels = fcluster(agrup, k, criterion='maxclust')
+        score = silhouette_score(m_dist, labels, metric='precomputed')
+        if score > mejor_score:
+            mejor_score = score
+            mejor_k = k
+            
+    alturas = agrup[:, 2]
+    # El umbral se sitúa justo por debajo del salto que genera el mejor_k
+    umbral_dinamico = alturas[-mejor_k + 1] if mejor_k > 1 else alturas.max()
+    return umbral_dinamico, mejor_k, mejor_score
 
 def guardar_matrices_csv(m_sim, m_dist, etiquetas, args):
     if args.output:
@@ -131,18 +153,17 @@ def main():
     total_comparaciones = (n * (n - 1)) // 2
     print(f"Procesando {n} estructuras ({total_comparaciones} comparaciones totales)...")
 
-    with tqdm(total=total_comparaciones, desc="Calculando TM-scores", unit="calc") as pbar:
+    # BARRA DE CARGA
+    with tqdm(total=total_comparaciones, desc="Calculando TM-scores", unit="calc", colour="green") as pbar:
         for i in range(n):
            for j in range(i+1, n):
                 s1, s2, tiempo = obtener_tm_score(protein_files[i], protein_files[j])
                 m_sim[i][j], m_sim[j][i] = s1, s2
                 tiempo_total += tiempo  
-            # Actualizamos la barra en 1 cada vez que termina un USalign
                 pbar.update(1)
     
-    print(f"El tiempo de ejecución fue de {tiempo_total:.2f} segundos -> {tiempo_total//60:.0f} minutos con {tiempo_total%60:.2f} segundos.")
-    # Cálculo corregido para el número exacto de comparaciones (n*(n-1)/2)
-    print(f"Con un promedio de {tiempo_total/((n*(n-1))/2):.2f} segundos por cálculo.")
+    print(f"El tiempo de ejecución fue de {tiempo_total:.2f} segundos.")
+    print(f"Promedio: {tiempo_total/total_comparaciones:.2f} s por cálculo.")
 
     m_sim_s = (m_sim + m_sim.T) / 2 
     m_dist = 1 - m_sim_s
@@ -156,16 +177,20 @@ def main():
     cond_dist = scipy.spatial.distance.squareform(m_dist)
     agrup = linkage(cond_dist, method="average")
 
+    # --- OPTIMIZACIÓN DINÁMICA CON SILHOUETTE ---
+    print("\nOptimizando umbral con Silhouette Score...")
+    umbral, k_optimo, score_optimo = optimizar_clustering(agrup, m_dist, n)
+    print(f"Configuración óptima: {k_optimo} clusters (Silhouette: {score_optimo:.3f})")
+
     # --- GENERACIÓN DE GRÁFICOS ---
     print("Generando Heatmaps...")
     generar_heat_maps(m_sim_s, m_dist, etiquetas, args)
 
     print("Generando Dendrograma...")
-    dist_max = max(agrup[:, 2])
-    umbral = dist_max * 0.70
     plt.figure(figsize=(12, max(10, n * 0.5)))
     dendrogram(agrup, labels=etiquetas, orientation='right', color_threshold=umbral)
-    plt.axvline(x=umbral, color='r', linestyle='--', label=f'Umbral ({umbral:.3f})')
+    plt.axvline(x=umbral, color='r', linestyle='--', label=f'Umbral Silhouette ({umbral:.3f})')
+    plt.title(f"Dendrograma Estructural (K={k_optimo}, Silueta={score_optimo:.2f})")
     plt.legend()
     
     if args.output:
@@ -173,7 +198,6 @@ def main():
         plt.savefig(nombre_dendro, dpi=300, bbox_inches='tight')
         print(f"Dendrograma guardado en: {nombre_dendro}")
         
-    # Restaurado el plt.show()
     plt.show()
 
     print("Generando Clustermap...")
