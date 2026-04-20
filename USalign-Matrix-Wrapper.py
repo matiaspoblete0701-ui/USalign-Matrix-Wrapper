@@ -3,6 +3,7 @@ import subprocess
 import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
+from tqdm import tqdm
 import scipy
 from scipy.cluster.hierarchy import linkage, dendrogram
 import os
@@ -124,17 +125,21 @@ def main():
     if n < 2:
         print("\n[!] ERROR: Se requieren al menos 2 archivos.")
         return 
-
-    print(f"Procesando {n} estructuras...")
+    
     m_sim = np.ones((n, n)) 
     tiempo_total = 0 
-    
-    for i in range(n):
-        for j in range(i+1, n):
-            s1, s2, tiempo = obtener_tm_score(protein_files[i], protein_files[j])
-            m_sim[i][j], m_sim[j][i] = s1, s2
-            tiempo_total += tiempo 
+    total_comparaciones = (n * (n - 1)) // 2
+    print(f"Procesando {n} estructuras ({total_comparaciones} comparaciones totales)...")
 
+    with tqdm(total=total_comparaciones, desc="Calculando TM-scores", unit="calc") as pbar:
+        for i in range(n):
+           for j in range(i+1, n):
+                s1, s2, tiempo = obtener_tm_score(protein_files[i], protein_files[j])
+                m_sim[i][j], m_sim[j][i] = s1, s2
+                tiempo_total += tiempo  
+            # Actualizamos la barra en 1 cada vez que termina un USalign
+                pbar.update(1)
+    
     print(f"El tiempo de ejecución fue de {tiempo_total:.2f} segundos -> {tiempo_total//60:.0f} minutos con {tiempo_total%60:.2f} segundos.")
     # Cálculo corregido para el número exacto de comparaciones (n*(n-1)/2)
     print(f"Con un promedio de {tiempo_total/((n*(n-1))/2):.2f} segundos por cálculo.")
