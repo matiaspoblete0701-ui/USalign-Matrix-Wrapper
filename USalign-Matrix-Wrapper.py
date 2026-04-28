@@ -27,36 +27,92 @@ def obtener_tm_score(pdb1, pdb2):
     return score1, score2, tiempo
 
 def definir_argumentos():
-    parser = argparse.ArgumentParser(description="Análisis de Similitud Estructural de Proteínas")
-    parser.add_argument("-r", "--ruta", nargs='+', required=True,
-                        help="Ruta(s) a las carpetas que contienen archivos .pdb o .cif")
-    parser.add_argument("-o", "--output", type=str, help="Prefijo para los archivos")
-    parser.add_argument("-d", "--outdir", type=str, default="resultados", help="Carpeta de salida")
+    parser = argparse.ArgumentParser(description="Análisis de Similitud Estructural")
+    parser.add_argument("-r", "--ruta", nargs='+', required=True, help="Ruta(s) a carpetas con PDB/CIF")
+    parser.add_argument("-o", "--output", type=str, required=True, help="Prefijo de salida")
+    parser.add_argument("-d", "--outdir", type=str, required=True, help="Carpeta de salida")
     return parser.parse_args()
 
 def optimizar_clustering(agrup, m_dist, n):
-    """Prueba diferentes números de clusters y devuelve el mejor umbral basado en Silhouette."""
-    mejor_score = -1
-    mejor_k = 2
-    
-    # Probamos desde 2 clusters hasta n-1 (máximo 10 para evitar ruido)
-    rango_k = range(2, min(n, 11)) 
-    
-    for k in rango_k:
-        labels = fcluster(agrup, k, criterion='maxclust')
-        score = silhouette_score(m_dist, labels, metric='precomputed')
-        if score > mejor_score:
-            mejor_score = score
-            mejor_k = k
-            
     alturas = agrup[:, 2]
-    # El umbral se sitúa justo por debajo del salto que genera el mejor_k
-    umbral_dinamico = alturas[-mejor_k + 1] if mejor_k > 1 else alturas.max()
-    return umbral_dinamico, mejor_k, mejor_score
+    dist_max = alturas.max() if len(alturas) > 0 else 1.0
+    umbral_minimo = dist_max * 0.25 
 
-# --- NUEVAS FUNCIONES PARA NEWICK ---
+    def buscar_mejor_k(matriz_distancia, linkage_matrix, rango, u_min):
+        mejor_s = -1
+        mejor_k_local = 2
+        n_local = len(matriz_distancia)
+        
+        for k in rango:
+            if k >= n_local: break
+            
+            if k > 1:
+                altura_corte = linkage_matrix[-k + 1, 2]
+                if altura_corte < u_min and k > 3:
+                    continue 
+
+            labels = fcluster(linkage_matrix, k, criterion='maxclust')
+            if len(set(labels)) < 2: continue
+            
+            score_base = silhouette_score(matriz_distancia, labels, metric='precomputed')
+            # Factor de penalización para evitar sobresegmentación
+            penalizacion = 1.0 - (k / (n_local * 2))
+            score_adj = score_base * penalizacion
+            
+            if score_adj > mejor_s:
+                mejor_s = score_adj
+                mejor_k_local = k
+        return mejor_k_local, mejor_s
+
+    k_global, s_global = buscar_mejor_k(m_dist, agrup, range(2, min(n, 11)), umbral_minimo)
+    
+    if s_global < 0.45 and n > 15:
+        labels_global = fcluster(agrup, k_global, criterion='maxclust')
+        cluster_mayoritario = np.argmax(np.bincount(labels_global))
+        indices_sub = np.where(labels_global == cluster_mayoritario)[0]
+
+        if len(indices_sub) > 10:
+            m_dist_sub = m_dist[np.ix_(indices_sub, indices_sub)]
+            agrup_sub = linkage(scipy.spatial.distance.squareform(m_dist_sub), method="average")
+            u_min_sub = agrup_sub[:, 2].max() * 0.2
+            
+            k_sub, s_sub = buscar_mejor_k(m_dist_sub, agrup_sub, range(2, min(len(indices_sub), 11)), u_min_sub)
+            
+            if s_sub > (s_global * 1.25):
+                return agrup_sub[-k_sub + 1, 2], f"Nested_{k_sub}", s_sub
+
+    umbral_final = alturas[-k_global + 1] if k_global > 1 else dist_max
+    return umbral_final, k_global, s_global
+
+def identificar_medoides(m_dist, etiquetas, labels):
+    medoides = {}
+    for cluster in np.unique(labels):
+        indices = np.where(labels == cluster)[0]
+        if len(indices) == 1:
+            medoides[cluster] = indices[0]
+        else:
+            sub_dist = m_dist[np.ix_(indices, indices)]
+            medoides[cluster] = indices[np.argmin(sub_dist.sum(axis=1))]
+    return medoides
+
+def exportar_visualizacion_pymol(medoides, protein_files, etiquetas, args):
+    ruta_pml = os.path.join(args.outdir, f"{args.output}_pymol.pml")
+    with open(ruta_pml, "w") as f:
+        f.write("reinitialize\n")
+        nombres = []
+        for cluster, idx in medoides.items():
+            path = os.path.abspath(protein_files[idx])
+            name = f"Cluster_{cluster}_{etiquetas[idx]}"
+            f.write(f"load {path}, {name}\n")
+            nombres.append(name)
+        if len(nombres) > 1:
+            target = nombres[0]
+            for i in range(1, len(nombres)):
+                f.write(f"align {nombres[i]}, {target}\n")
+        f.write("zoom\n")
+    print(f"[*] Script de PyMOL guardado: {ruta_pml}")
+
 def construir_newick(nodo, newick, parentdist, nombres_hojas):
-    """Función recursiva para traducir nodos de SciPy a texto Newick."""
     if nodo.is_leaf():
         return f"{nombres_hojas[nodo.id]}:{(parentdist - nodo.dist):.6f}{newick}"
     else:
@@ -65,170 +121,76 @@ def construir_newick(nodo, newick, parentdist, nombres_hojas):
         newick = f"({construir_newick(nodo.left, '', nodo.dist, nombres_hojas)},{construir_newick(nodo.right, '', nodo.dist, nombres_hojas)}){newick}"
         return newick
 
-def guardar_newick(agrup, etiquetas, args):
-    """Genera y guarda el archivo .nwk"""
-    if args.output:
-        arbol = to_tree(agrup, rd=False)
-        cadena_newick = construir_newick(arbol, "", arbol.dist, etiquetas) + ";"
-        ruta_newick = os.path.join(args.outdir, f"{args.output}_arbol.nwk")
-        with open(ruta_newick, "w") as f:
-            f.write(cadena_newick)
-        print(f"Formato Newick guardado en: {ruta_newick}")
-# ------------------------------------
-
-def guardar_matrices_csv(m_sim, m_dist, etiquetas, args):
-    if args.output:
-        ruta_sim = os.path.join(args.outdir, f"{args.output}_similitud.csv")
-        ruta_dist = os.path.join(args.outdir, f"{args.output}_distancia.csv")
-        
-        df_sim = pd.DataFrame(m_sim, index=etiquetas, columns=etiquetas)
-        df_dist = pd.DataFrame(m_dist, index=etiquetas, columns=etiquetas)
-        
-        df_sim.to_csv(ruta_sim)
-        df_dist.to_csv(ruta_dist)
-        print(f"Matrices CSV guardadas en: {args.outdir}")
-
-def generar_heat_maps(m_sim, m_dist_sim, etiquetas, args):
-    tareas = [
-        (m_sim, "similitud", "coolwarm", 0, 1),
-        (m_dist_sim, "distancia", "viridis", 0, 1)
-    ]
-    
-    n_prot = len(etiquetas)
-    lado_figura = max(10, n_prot * 0.5) 
-    
-    for matriz, nombre_base, mapa_color, v_min, v_max in tareas:
-        plt.figure(figsize=(lado_figura, lado_figura)) 
-        ax = sns.heatmap(
-            matriz, 
-            xticklabels=etiquetas, 
-            yticklabels=etiquetas, 
-            cmap=mapa_color, 
-            vmin=v_min, 
-            vmax=v_max,
-            annot=False, 
-            fmt=".3f"
-        )    
-        plt.setp(ax.get_xticklabels(), rotation=45, ha="right", rotation_mode="anchor")
-        plt.tight_layout()
-        
-        if args.output: 
-            nombre_final = os.path.join(args.outdir, f"{args.output}_{nombre_base}.png")
-            plt.savefig(nombre_final, dpi=300)
-            print(f"Heatmap guardado en: {nombre_final}")
-        
-        plt.show()
-
-def generar_clustermap(m_sim_s, agrup, etiquetas, args):
-    n_prot = len(etiquetas)
-    lado_figura = max(10, n_prot * 0.5) 
-    
-    g = sns.clustermap(
-        m_sim_s,
-        row_linkage=agrup,
-        col_linkage=agrup,
-        xticklabels=etiquetas,
-        yticklabels=etiquetas,
-        cmap="coolwarm", 
-        vmin=0, 
-        vmax=1,
-        annot=False, 
-        fmt=".3f",
-        figsize=(lado_figura, lado_figura), 
-        dendrogram_ratio=0.15,
-        cbar_pos=(0.02, 0.8, 0.03, 0.15),
-        tree_kws={'colors': 'gray', 'linewidths': 1.5}
-    )
-
-    plt.setp(g.ax_heatmap.get_xticklabels(), rotation=45, ha="right", rotation_mode="anchor")
-    
-    if args.output:
-        nombre_final = os.path.join(args.outdir, f"{args.output}_clustermap.png")
-        g.savefig(nombre_final, dpi=300, bbox_inches='tight')
-        print(f"Clustermap guardado en: {nombre_final}")
-        
-    plt.show()
-
 def main():
     args = definir_argumentos() 
-    if args.output:
-        os.makedirs(args.outdir, exist_ok=True)
-
+    os.makedirs(args.outdir, exist_ok=True)
+    
     protein_files = []
     for carpeta in args.ruta:
         if os.path.isdir(carpeta):
-            protein_files.extend(glob.glob(os.path.join(carpeta, "*.pdb")) + 
-                                glob.glob(os.path.join(carpeta, "*.cif")) +
-                                glob.glob(os.path.join(carpeta, "*.cif.gz")) +
-                                glob.glob(os.path.join(carpeta, "*.pdb.gz")))
-
+            for ext in ["*.pdb", "*.cif", "*.cif.gz", "*.pdb.gz"]:
+                protein_files.extend(glob.glob(os.path.join(carpeta, ext)))
+                
     protein_files = sorted(list(set(protein_files)))
     n = len(protein_files)
-    
-    if n < 2:
-        print("\n[!] ERROR: Se requieren al menos 2 archivos.")
-        return 
+    if n < 2: return 
     
     m_sim = np.ones((n, n)) 
-    tiempo_total = 0 
     total_comparaciones = (n * (n - 1)) // 2
-    print(f"Procesando {n} estructuras ({total_comparaciones} comparaciones totales)...")
-
-    # BARRA DE CARGA
-    with tqdm(total=total_comparaciones, desc="Calculando TM-scores", unit="calc", colour="green") as pbar:
+    with tqdm(total=total_comparaciones, desc="TM-scores", unit="calc", colour="green") as pbar:
         for i in range(n):
            for j in range(i+1, n):
-                s1, s2, tiempo = obtener_tm_score(protein_files[i], protein_files[j])
+                s1, s2, _ = obtener_tm_score(protein_files[i], protein_files[j])
                 m_sim[i][j], m_sim[j][i] = s1, s2
-                tiempo_total += tiempo  
                 pbar.update(1)
     
-    print(f"El tiempo de ejecución fue de {tiempo_total:.2f} segundos ->> {int(tiempo_total//3600)} horas con {int((tiempo_total%3600)//60)} minutos con {tiempo_total%60:.2f} segundos")
-    print(f"Promedio: {tiempo_total/total_comparaciones:.2f} s por cálculo.")
-
     m_sim_s = (m_sim + m_sim.T) / 2 
     m_dist = 1 - m_sim_s
     np.fill_diagonal(m_dist, 0) 
     etiquetas = [os.path.basename(p).split('.')[0] for p in protein_files]
 
-    # --- GUARDADO DE DATOS CRUDOS ---
-    guardar_matrices_csv(m_sim_s, m_dist, etiquetas, args)
+    # Guardado de matrices
+    ruta_sim = os.path.join(args.outdir, f"{args.output}_similitud.csv")
+    pd.DataFrame(m_sim_s, index=etiquetas, columns=etiquetas).to_csv(ruta_sim)
+    ruta_dist = os.path.join(args.outdir, f"{args.output}_distancia.csv")
+    pd.DataFrame(m_dist, index=etiquetas, columns=etiquetas).to_csv(ruta_dist)
+    print(f"[*] Matrices guardadas en: {args.outdir}")
 
-    # --- CÁLCULO DEL AGRUPAMIENTO ---
-    cond_dist = scipy.spatial.distance.squareform(m_dist)
-    agrup = linkage(cond_dist, method="average")
+    # Clustering
+    agrup = linkage(scipy.spatial.distance.squareform(m_dist), method="average")
+    umbral, k_final, score_final = optimizar_clustering(agrup, m_dist, n)
+    print(f"\n[+] Resultado: {k_final} clusters encontrados (Silueta Ajustada: {score_final:.3f})")
+    
+    labels = fcluster(agrup, umbral, criterion='distance')
+    medoides_dict = identificar_medoides(m_dist, etiquetas, labels)
+    
+    # Archivos adicionales
+    ruta_res = os.path.join(args.outdir, f"{args.output}_clusters.csv")
+    pd.DataFrame({
+        "Proteina": etiquetas,
+        "Cluster": labels,
+        "Es_Medoide": [1 if i in medoides_dict.values() else 0 for i in range(n)]
+    }).to_csv(ruta_res, index=False)
+    print(f"[*] Clústeres y medoides guardados: {ruta_res}")
 
-    # --- OPTIMIZACIÓN DINÁMICA CON SILHOUETTE ---
-    print("\nOptimizando umbral con Silhouette Score...")
-    umbral, k_optimo, score_optimo = optimizar_clustering(agrup, m_dist, n)
-    print(f"Configuración óptima: {k_optimo} clusters (Silhouette: {score_optimo:.3f})")
+    exportar_visualizacion_pymol(medoides_dict, protein_files, etiquetas, args)
 
-    # --- GENERACIÓN DE GRÁFICOS Y NEWICK ---
-    print("Generando Heatmaps...")
-    generar_heat_maps(m_sim_s, m_dist, etiquetas, args)
-
-    print("Generando Dendrograma...")
-    plt.figure(figsize=(12, max(10, n * 0.5)))
+    arbol = to_tree(agrup, rd=False)
+    with open(os.path.join(args.outdir, f"{args.output}_arbol.nwk"), "w") as f:
+        f.write(construir_newick(arbol, "", arbol.dist, etiquetas) + ";")
+    
+    # Gráficos
+    plt.figure(figsize=(12, max(8, n * 0.4)))
     dendrogram(agrup, labels=etiquetas, orientation='right', color_threshold=umbral)
-    plt.axvline(x=umbral, color='r', linestyle='--', label=f'Umbral Silhouette ({umbral:.3f})')
-    plt.title(f"Dendrograma Estructural (K={k_optimo}, Silueta={score_optimo:.2f})")
-    plt.legend()
-    
-    if args.output:
-        nombre_dendro = os.path.join(args.outdir, f"{args.output}_dendrograma.png")
-        plt.savefig(nombre_dendro, dpi=300, bbox_inches='tight')
-        print(f"Dendrograma guardado en: {nombre_dendro}")
-        
-        # Guardamos el formato Newick justo después del dendrograma
-        guardar_newick(agrup, etiquetas, args)
-        
-    plt.show()
+    plt.axvline(x=umbral, color='r', linestyle='--', label=f'Umbral ({umbral:.3f})')
+    plt.title(f"Dendrograma Estructural (K={k_final})")
+    plt.savefig(os.path.join(args.outdir, f"{args.output}_dendrograma.pdf"), bbox_inches='tight')
+    plt.close()
 
-    print("Generando Clustermap...")
-    generar_clustermap(m_sim_s, agrup, etiquetas, args)
-    
-    if args.output:
-        print(f"\nLos resultados están en la carpeta: {args.outdir}")
+    sns.clustermap(m_sim_s, row_linkage=agrup, col_linkage=agrup, cmap="coolwarm", xticklabels=etiquetas, yticklabels=etiquetas)
+    plt.savefig(os.path.join(args.outdir, f"{args.output}_clustermap.pdf"), bbox_inches='tight')
+    plt.close()
+    print(f"[!] Proceso finalizado exitosamente.")
 
 if __name__ == "__main__":
     main()
